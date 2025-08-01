@@ -10,7 +10,10 @@ Features:
 - Produces thread metadata for cleaner track display in Perfetto
 
 Usage:
-    python armnn_to_perfetto.py --input out.json --output perfetto_trace.json --flows
+    python armnn_to_perfetto.py --input out.json --output perfetto_trace.json [--flows] [--no-beg-end]
+
+By default, spans are emitted as separate Begin (ph=B) and End (ph=E) events.
+Use `--no-beg-end` to emit complete events (ph=X) instead.
 """
 
 import json
@@ -18,6 +21,9 @@ import re
 import argparse
 import os
 from typing import List, Dict, Any
+
+# Global flow ID counter for flow events
+flow_id = 1
 
 
 def clean_json_text(file_path: str) -> Any:
@@ -58,9 +64,15 @@ def is_kernel_measurement(k: str, v: Dict) -> bool:
     )
 
 
-def extract_events(obj, trace_events: List[Dict], emit_flows: bool = False, pid: int = 0, tid_base: int = 0, stack: List[str] = []):
+def extract_events(obj,
+                   trace_events: List[Dict],
+                   emit_flows: bool = False,
+                   pid: int = 0,
+                   tid_base: int = 0,
+                   stack: List[str] = [],
+                   use_beg_end: bool = False):
     """
-    Recursively walk through the JSON structure to extract slices and optional flow events.
+    Recursively walk through the JSON structure to extract events (complete or begin/end) and optional flow events.
     """
     global flow_id
     if isinstance(obj, dict):
@@ -71,17 +83,40 @@ def extract_events(obj, trace_events: List[Dict], emit_flows: bool = False, pid:
                 stop_us = v[next(x for x in v if x.startswith("Wall clock time (Stop)"))]["raw"][0]
                 dur_us = stop_us - start_us
 
-                # Parent ArmNN-level event
-                trace_events.append({
-                    "name": name,
-                    "cat": "armnn",
-                    "ph": "X",
-                    "ts": start_us,
-                    "dur": dur_us,
-                    "pid": pid,
-                    "tid": tid_base,
-                    "args": {}
-                })
+                # Parent ArmNN-level event(s)
+                if use_beg_end:
+                    # Begin event
+                    trace_events.append({
+                        "name": name,
+                        "cat": "armnn",
+                        "ph": "B",
+                        "ts": start_us,
+                        "pid": pid,
+                        "tid": tid_base,
+                        "args": {}
+                    })
+                    # End event
+                    trace_events.append({
+                        "name": name,
+                        "cat": "armnn",
+                        "ph": "E",
+                        "ts": start_us + dur_us,
+                        "pid": pid,
+                        "tid": tid_base,
+                        "args": {}
+                    })
+                else:
+                    # Complete event
+                    trace_events.append({
+                        "name": name,
+                        "cat": "armnn",
+                        "ph": "X",
+                        "ts": start_us,
+                        "dur": dur_us,
+                        "pid": pid,
+                        "tid": tid_base,
+                        "args": {}
+                    })
 
                 kernel_start = start_us
                 for sub_k, sub_v in v.items():
@@ -109,16 +144,39 @@ def extract_events(obj, trace_events: List[Dict], emit_flows: bool = False, pid:
                         tid = 1 if cat == "opencl.gemm_mm" else 2
 
                         # Child event
-                        trace_events.append({
-                            "name": kernel_name,
-                            "cat": cat,
-                            "ph": "X",
-                            "ts": kernel_start,
-                            "dur": duration,
-                            "pid": pid,
-                            "tid": tid,
-                            "args": args
-                        })
+                        if use_beg_end:
+                            # Begin kernel slice
+                            trace_events.append({
+                                "name": kernel_name,
+                                "cat": cat,
+                                "ph": "B",
+                                "ts": kernel_start,
+                                "pid": pid,
+                                "tid": tid,
+                                "args": args
+                            })
+                            # End kernel slice
+                            trace_events.append({
+                                "name": kernel_name,
+                                "cat": cat,
+                                "ph": "E",
+                                "ts": kernel_start + duration,
+                                "pid": pid,
+                                "tid": tid,
+                                "args": args
+                            })
+                        else:
+                            # Complete kernel event
+                            trace_events.append({
+                                "name": kernel_name,
+                                "cat": cat,
+                                "ph": "X",
+                                "ts": kernel_start,
+                                "dur": duration,
+                                "pid": pid,
+                                "tid": tid,
+                                "args": args
+                            })
 
                         # Flow arrows
                         if emit_flows:
@@ -142,22 +200,25 @@ def extract_events(obj, trace_events: List[Dict], emit_flows: bool = False, pid:
                         kernel_start += duration
                         flow_id += 1
 
-                extract_events(v, trace_events, emit_flows, pid, tid_base, stack + [k])
+                extract_events(v, trace_events, emit_flows, pid, tid_base, stack + [k], use_beg_end)
             else:
-                extract_events(v, trace_events, emit_flows, pid, tid_base, stack + [k])
+                extract_events(v, trace_events, emit_flows, pid, tid_base, stack + [k], use_beg_end)
     elif isinstance(obj, list):
         for i, item in enumerate(obj):
-            extract_events(item, trace_events, emit_flows, pid, tid_base, stack + [str(i)])
+            extract_events(item, trace_events, emit_flows, pid, tid_base, stack + [str(i)], use_beg_end)
 
 
-def generate_perfetto_trace(input_path: str, output_path: str, emit_flows: bool = False):
+def generate_perfetto_trace(input_path: str,
+                            output_path: str,
+                            emit_flows: bool = False,
+                            use_beg_end: bool = False):
     """
     Loads the input ArmNN JSON trace and writes a Perfetto-compatible trace JSON.
     """
     data = clean_json_text(input_path)
     trace_events = []
 
-    extract_events(data, trace_events, emit_flows=emit_flows)
+    extract_events(data, trace_events, emit_flows=emit_flows, use_beg_end=use_beg_end)
 
     thread_metadata = [
         { "ph": "M", "pid": 0, "name": "process_name", "args": { "name": "ArmNN Trace" } },
@@ -183,6 +244,8 @@ if __name__ == "__main__":
     parser.add_argument('--input', '-i', required=True, help='Path to input ArmNN JSON trace')
     parser.add_argument('--output', '-o', required=True, help='Path to output Perfetto JSON trace')
     parser.add_argument('--flows', action='store_true', help='Enable flow arrows between parent and kernel slices')
+    parser.add_argument('--no-beg-end', dest='no_beg_end', action='store_true',
+                        help='Emit complete events (ph=X) instead of default Begin/End (ph=B/E)')
     args = parser.parse_args()
 
     # Global flow ID counter
@@ -192,4 +255,10 @@ if __name__ == "__main__":
         print(f"❌ Input file does not exist: {args.input}")
         exit(1)
 
-    generate_perfetto_trace(args.input, args.output, emit_flows=args.flows)
+    # Default is Begin/End slices; --no-beg-end produces complete events (ph=X)
+    generate_perfetto_trace(
+        args.input,
+        args.output,
+        emit_flows=args.flows,
+        use_beg_end=not args.no_beg_end
+    )
